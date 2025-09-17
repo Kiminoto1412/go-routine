@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Task struct
+// Task struct ------------------------------------------------
 type Task struct {
 	ID       string
 	Created  time.Time
@@ -16,16 +16,17 @@ type Task struct {
 	Retries  int
 	MaxRetry int
 	Done     bool
-	expireAt time.Time // เวลา timeout ของ task
+	expireAt time.Time // เวลาที่หมดอายุ (นับตอน active เท่านั้น)
 }
 
-// TaskHeap: priority queue (min-heap) -------------------
+// TaskHeap: priority queue (min-heap) ------------------------
 type TaskHeap struct {
 	tasks []Task
 }
 
 func (h TaskHeap) Len() int { return len(h.tasks) }
 
+// ค่าที่ใช้คิด swap
 func (h TaskHeap) Less(i, j int) bool {
 	return h.tasks[i].expireAt.Before(h.tasks[j].expireAt)
 }
@@ -51,7 +52,7 @@ func (h TaskHeap) Peek() (Task, bool) {
 	return h.tasks[0], true
 }
 
-// Watcher --------------------------------------------
+// Watcher ----------------------------------------------------
 type Watcher struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
@@ -66,6 +67,7 @@ type Watcher struct {
 	mu sync.Mutex
 }
 
+// NewWatcher -------------------------------------------------
 func NewWatcher(maxConcurrent int) *Watcher {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &TaskHeap{tasks: []Task{}}
@@ -83,7 +85,7 @@ func NewWatcher(maxConcurrent int) *Watcher {
 	}
 }
 
-// AddTask ------------------------------------------------
+// AddTask ----------------------------------------------------
 func (w *Watcher) AddTask(t Task) {
 	select {
 	case w.tasksCh <- t:
@@ -93,7 +95,7 @@ func (w *Watcher) AddTask(t Task) {
 	}
 }
 
-// Start --------------------------------------------------
+// Start ------------------------------------------------------
 func (w *Watcher) Start() {
 	// Goroutine #1: consumer
 	go func() {
@@ -104,16 +106,16 @@ func (w *Watcher) Start() {
 			case t := <-w.tasksCh:
 				w.mu.Lock()
 				if len(w.activeTasks) < w.maxConcurrent {
+					// ✅ set expireAt ตอน active เท่านั้น
 					t.Created = time.Now()
 					t.expireAt = t.Created.Add(t.Timeout)
+
 					w.activeTasks[t.ID] = t
 					heap.Push(w.taskHeap, t)
-					fmt.Printf("🚀 Start task: %s (retry=%d, expireAt=%v)\n",
-						t.ID, t.Retries, t.expireAt.Format("15:04:05"))
 					w.signalRunner()
 				} else {
-					w.waitingQueue = append(w.waitingQueue, t)
-					fmt.Printf("⏳ Queue task: %s (waiting)\n", t.ID)
+					// ❌ ยังไม่ set expireAt ตอน queue
+					w.waitingQueue = append(w.waitingQueue, t)					
 				}
 				w.mu.Unlock()
 			}
@@ -149,8 +151,7 @@ func (w *Watcher) Start() {
 					expired.Retries++
 					if expired.MaxRetry == 0 || expired.Retries <= expired.MaxRetry {
 						fmt.Printf("🔄 Retry task: %s (retry=%d)\n", expired.ID, expired.Retries)
-						expired.Created = time.Now()
-						expired.expireAt = expired.Created.Add(expired.Timeout)
+
 						w.waitingQueue = append(w.waitingQueue, expired)
 					} else {
 						fmt.Printf("❌ Task %s failed after max retries\n", expired.ID)
@@ -165,39 +166,62 @@ func (w *Watcher) Start() {
 	}()
 }
 
+// Stop -------------------------------------------------------
 func (w *Watcher) Stop() {
 	w.cancel()
 }
 
+// promoteWaitingTasks ----------------------------------------
 func (w *Watcher) promoteWaitingTasks() {
 	for len(w.activeTasks) < w.maxConcurrent && len(w.waitingQueue) > 0 {
 		next := w.waitingQueue[0]
 		w.waitingQueue = w.waitingQueue[1:]
+
+		// ✅ set expireAt when promote
 		next.Created = time.Now()
 		next.expireAt = next.Created.Add(next.Timeout)
+
 		w.activeTasks[next.ID] = next
 		heap.Push(w.taskHeap, next)
-		fmt.Printf("🚀 Start task from queue: %s (retry=%d, expireAt=%v)\n",
-			next.ID, next.Retries, next.expireAt.Format("15:04:05"))
 		w.signalRunner()
 	}
 }
 
+// MarkTaskDone ----------------------------------------------
 func (w *Watcher) MarkTaskDone(taskID string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	if t, exists := w.activeTasks[taskID]; exists {
-		t.Done = true
-		w.activeTasks[taskID] = t // Update the task in the map
+	// 1. If in activeTasks → remove
+	if _, exists := w.activeTasks[taskID]; exists {
 		delete(w.activeTasks, taskID)
-		fmt.Println("✅ Task marked done by external API:", taskID)
-	} else {
-		fmt.Println("⚠️ Task not found or already done:", taskID)
+		fmt.Println("✅ Task marked done by external API (active):", taskID)
+		w.promoteWaitingTasks()
+		return
 	}
-	w.promoteWaitingTasks()
+
+	// 2. If in waitingQueue → remove
+	newQueue := make([]Task, 0, len(w.waitingQueue))
+	found := false
+	for _, t := range w.waitingQueue {
+		if t.ID == taskID {
+			found = true
+			continue // skip this one → remove
+		}
+		newQueue = append(newQueue, t)
+	}
+	if found {
+		w.waitingQueue = newQueue
+		fmt.Println("✅ Task marked done by external API (waiting):", taskID)
+		return
+	}
+
+	// 3. If not found
+	fmt.Println("⚠️ Task not found or already done:", taskID)
 }
 
+
+// signalRunner ----------------------------------------------
 func (w *Watcher) signalRunner() {
 	select {
 	case w.notifyCh <- struct{}{}:
@@ -219,4 +243,3 @@ func (w *Watcher) PrintHeap() {
 			i, t.ID, t.expireAt.Format("15:04:05"), t.Done, t.Retries)
 	}
 }
-
