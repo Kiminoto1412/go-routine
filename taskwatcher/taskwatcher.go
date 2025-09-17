@@ -1,3 +1,4 @@
+
 package taskwatcher
 
 import (
@@ -16,7 +17,7 @@ type Task struct {
 	Retries  int
 	MaxRetry int
 	Done     bool
-	expireAt time.Time // เวลาที่หมดอายุ (นับตอน active เท่านั้น)
+	expireAt time.Time // (start from active)
 }
 
 // TaskHeap: priority queue (min-heap) ------------------------
@@ -26,7 +27,7 @@ type TaskHeap struct {
 
 func (h TaskHeap) Len() int { return len(h.tasks) }
 
-// ค่าที่ใช้คิด swap
+// value used to calculate swap
 func (h TaskHeap) Less(i, j int) bool {
 	return h.tasks[i].expireAt.Before(h.tasks[j].expireAt)
 }
@@ -58,7 +59,7 @@ type Watcher struct {
 	cancel        context.CancelFunc
 	maxConcurrent int
 	tasksCh       chan Task
-	notifyCh      chan struct{} // ปลุก runner เวลามีงานใหม่
+	notifyCh      chan struct{} // wake-up runner
 
 	activeTasks  map[string]Task
 	waitingQueue []Task
@@ -106,7 +107,7 @@ func (w *Watcher) Start() {
 			case t := <-w.tasksCh:
 				w.mu.Lock()
 				if len(w.activeTasks) < w.maxConcurrent {
-					// ✅ set expireAt ตอน active เท่านั้น
+					// set expireAt (start from active)
 					t.Created = time.Now()
 					t.expireAt = t.Created.Add(t.Timeout)
 
@@ -114,7 +115,7 @@ func (w *Watcher) Start() {
 					heap.Push(w.taskHeap, t)
 					w.signalRunner()
 				} else {
-					// ❌ ยังไม่ set expireAt ตอน queue
+					// not set expireAt (start from queue)
 					w.waitingQueue = append(w.waitingQueue, t)					
 				}
 				w.mu.Unlock()
@@ -122,7 +123,7 @@ func (w *Watcher) Start() {
 		}
 	}()
 
-	// Goroutine #2: runner (ใช้ heap)
+	// Goroutine #2: runner (use heap)
 	go func() {
 		for {
 			w.mu.Lock()
@@ -131,7 +132,7 @@ func (w *Watcher) Start() {
 				select {
 				case <-w.ctx.Done():
 					return
-				case <-w.notifyCh: // รอจนมีงานใหม่
+				case <-w.notifyCh: // wait for new task
 					continue
 				}
 			}
@@ -143,7 +144,7 @@ func (w *Watcher) Start() {
 			case <-w.ctx.Done():
 				return
 			case <-time.After(wait):
-				// หมดเวลา → handle
+				// timeout → handle
 				w.mu.Lock()
 				expired := heap.Pop(w.taskHeap).(Task)
 				if _, exists := w.activeTasks[expired.ID]; exists && !expired.Done {
@@ -160,7 +161,7 @@ func (w *Watcher) Start() {
 				w.promoteWaitingTasks()
 				w.mu.Unlock()
 			case <-w.notifyCh:
-				// แค่ wake-up → loop จะ recalibrate timeout ใหม่
+				// just wake-up → loop will recalibrate timeout
 			}
 		}
 	}()
@@ -177,7 +178,7 @@ func (w *Watcher) promoteWaitingTasks() {
 		next := w.waitingQueue[0]
 		w.waitingQueue = w.waitingQueue[1:]
 
-		// ✅ set expireAt when promote
+		// set expireAt when promote
 		next.Created = time.Now()
 		next.expireAt = next.Created.Add(next.Timeout)
 
